@@ -8,16 +8,20 @@ works in that field for the same year, then writes a CSV and a line chart.
 
 Usage:
     pip install requests pandas matplotlib
-    python topic_trends.py --email you@example.com [--start 1950 --end 2024]
+    python topic_trends.py --email you@example.com [--api-key KEY] [--start 1950 --end 2024]
 
-The e-mail is sent to OpenAlex as the `mailto` parameter so that requests go to
-its "polite pool"; it is not used for anything else.
+The e-mail is sent to OpenAlex as the `mailto` parameter; it is not used for
+anything else. OpenAlex meters requests without a key against a free daily
+budget shared by everyone on the same IP address. A free personal key
+(https://help.openalex.org/api/authentication/) avoids that; pass it with
+--api-key or set the OPENALEX_API_KEY environment variable.
 
 Caveat: keyword matches only approximate research topics, and coverage of
 older abstracts in OpenAlex is uneven, so compare relative trends rather than
 absolute levels.
 """
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -47,17 +51,27 @@ def search_expr(terms):
     return '(' + ' OR '.join(f'"{t}"' for t in terms) + ')'
 
 
-def counts_by_year(filters, email, start, end):
+class BudgetExhausted(RuntimeError):
+    pass
+
+
+def counts_by_year(filters, email, start, end, api_key=None):
     params = {
         'filter': ','.join(filters + [f'publication_year:{start}-{end}']),
         'group_by': 'publication_year',
         'per_page': 200,
         'mailto': email,
     }
+    if api_key:
+        params['api_key'] = api_key
     for attempt in range(4):
         r = requests.get(API, params=params, timeout=60)
         if r.status_code == 200:
             return {int(g['key']): g['count'] for g in r.json()['group_by']}
+        if r.status_code == 429 and 'budget' in r.text.lower():
+            raise BudgetExhausted(
+                'OpenAlex daily budget exhausted for this IP. Use a free API key '
+                '(--api-key or OPENALEX_API_KEY) or retry after midnight UTC.')
         if r.status_code in (429, 500, 502, 503):
             time.sleep(2 ** attempt)
             continue
@@ -68,6 +82,8 @@ def counts_by_year(filters, email, start, end):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--email', required=True, help='contact e-mail for the OpenAlex polite pool')
+    ap.add_argument('--api-key', default=os.environ.get('OPENALEX_API_KEY'),
+                    help='OpenAlex API key (default: $OPENALEX_API_KEY)')
     ap.add_argument('--start', type=int, default=1950)
     ap.add_argument('--end', type=int, default=2024)
     ap.add_argument('--out', default=str(Path(__file__).with_name('topic_trends')))
@@ -78,16 +94,18 @@ def main():
 
     field = FIELD_FILTER
     try:
-        total = counts_by_year([field], args.email, args.start, args.end)
+        total = counts_by_year([field], args.email, args.start, args.end, args.api_key)
+    except BudgetExhausted:
+        raise
     except RuntimeError:
         field = CONCEPT_FILTER
-        total = counts_by_year([field], args.email, args.start, args.end)
+        total = counts_by_year([field], args.email, args.start, args.end, args.api_key)
 
     years = list(range(args.start, args.end + 1))
     df = pd.DataFrame({'year': years, 'economics_total': [total.get(y, 0) for y in years]})
     for name, terms in GROUPS.items():
         c = counts_by_year([field, f'title_and_abstract.search:{search_expr(terms)}'],
-                           args.email, args.start, args.end)
+                           args.email, args.start, args.end, args.api_key)
         df[name] = [c.get(y, 0) for y in years]
         time.sleep(0.2)
     shares = df[list(GROUPS)].div(df['economics_total'].where(df['economics_total'] > 0), axis=0) * 1000
@@ -96,7 +114,7 @@ def main():
     df.to_csv(args.out + '_counts.csv', index=False, encoding='utf-8-sig')
     shares.to_csv(args.out + '_per_1000.csv', index=False, encoding='utf-8-sig')
 
-    plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+    plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'WenQuanYi Zen Hei', 'SimHei', 'Microsoft YaHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
     fig, ax = plt.subplots(figsize=(11, 6))
     smooth = shares.set_index('year').rolling(3, center=True, min_periods=1).mean()
